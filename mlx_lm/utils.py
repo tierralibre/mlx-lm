@@ -46,6 +46,7 @@ MODEL_REMAPPING = {
     "mistral": "llama",  # mistral is compatible with llama
     "phi-msft": "phixtral",
     "falcon_mamba": "mamba",
+    "qwen2_embed": "qwen3_embed",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -61,7 +62,11 @@ def _get_classes(config: dict):
     Returns:
         A tuple containing the Model class and the ModelArgs class.
     """
-    model_type = config["model_type"]
+    # Support explicit embedding task or model_type override
+    model_type = config.get("model_type", "")
+    if config.get("task", "") == "embed":
+        model_type = "qwen3_embed"
+
     model_type = MODEL_REMAPPING.get(model_type, model_type)
     try:
         arch = importlib.import_module(f"mlx_lm.models.{model_type}")

@@ -286,6 +286,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
             "/chat/completions": self.handle_chat_completions,
+        "/v1/embeddings": self.handle_embeddings,
         }
 
         if self.path not in endpoints:
@@ -353,14 +354,19 @@ class APIHandler(BaseHTTPRequestHandler):
             for stop_word in stop_words
         ]
 
-        # Send header type
+        if self.path == "/v1/embeddings":
+            # Endpoint writes its own headers and response.
+            endpoints[self.path]()
+            return
+
+        # Send header type for completion endpoints
         (
             self._set_stream_headers(200)
             if self.stream
             else self._set_completion_headers(200)
         )
 
-        # Call endpoint specific method
+        # Call completion endpoint and stream or send response
         prompt = endpoints[self.path]()
         self.handle_completion(prompt, stop_id_sequences)
 
@@ -778,6 +784,44 @@ class APIHandler(BaseHTTPRequestHandler):
 
         return prompt
 
+    def handle_embeddings(self):
+        """Handle an embedding request compatible with OpenAI style."""
+        inputs = self.body.get("input")
+        if isinstance(inputs, str):
+            inputs = [inputs]
+        assert isinstance(inputs, list), "input must be a string or list of strings"
+
+        embeddings = []
+        for idx, text in enumerate(inputs):
+            token_ids = self.tokenizer.encode(text, add_special_tokens=True)
+            mx_tokens = mx.array([token_ids])
+            outputs = self.model_provider.model(mx_tokens)
+            # Expect model forward to return dict with "embeddings"
+            vec = (
+                outputs if isinstance(outputs, mx.array) else outputs.get("embeddings", outputs)
+            )
+            embeddings.append(
+                {
+                    "object": "embedding",
+                    "embedding": vec.squeeze().tolist(),
+                    "index": idx,
+                }
+            )
+
+        response = {
+            "object": "list",
+            "data": embeddings,
+            "model": self.requested_model,
+        }
+
+        response_json = json.dumps(response).encode()
+        self._set_completion_headers(200)
+        self.send_header("Content-Length", str(len(response_json)))
+        self.end_headers()
+        self.wfile.write(response_json)
+        self.wfile.flush()
+
+
     def handle_text_completions(self) -> List[int]:
         """
         Handle a text completion request.
@@ -974,6 +1018,13 @@ def main():
         type=int,
         default=512,
         help="Default maximum number of tokens to generate (default: 512)",
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        default="generate",
+        choices=["generate", "embed"],
+        help="Task type: generate (default) or embed",
     )
     parser.add_argument(
         "--chat-template-args",

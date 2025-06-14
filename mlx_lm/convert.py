@@ -100,7 +100,9 @@ def convert(
     quant_predicate: Optional[
         Union[Callable[[str, nn.Module, dict], Union[bool, dict]], str]
     ] = None,
+    task: str = "generate",
 ):
+
     # Check the save path is empty
     if isinstance(mlx_path, str):
         mlx_path = Path(mlx_path)
@@ -113,7 +115,41 @@ def convert(
 
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
-    model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
+
+    # Custom path for embedding task
+    if task == "embed":
+        import json, glob
+        import safetensors.torch as sttorch
+        from .tokenizer_utils import load_tokenizer
+        from .utils import _get_classes
+
+        with open(model_path / "config.json", "r") as f:
+            config = json.load(f)
+        config["task"] = "embed"
+        config["model_type"] = "qwen2_embed"
+        # Filter HF config keys when building ArgsCls
+        config = {k: v for k, v in config.items() if not k.startswith("hf_")}
+        # Build model
+        ModelCls, ArgsCls = _get_classes(config)
+        allowed_keys = ArgsCls.__init__.__code__.co_varnames
+        args = ArgsCls(**{k: v for k, v in config.items() if k in allowed_keys})
+        model = ModelCls(args)
+        # Load weights from safetensors
+        weight_files = glob.glob(str(model_path / "*.safetensors"))
+        weights = {}
+        import torch
+        for wf in weight_files:
+            w = sttorch.load_file(wf, device="cpu")
+            processed = {}
+            for k, v in w.items():
+                if v.dtype == torch.bfloat16:
+                    v = v.to(torch.float16)
+                processed[k] = mx.array(v.cpu().numpy())
+            weights.update(processed)
+        model.load_weights(list(weights.items()), strict=False)
+        tokenizer = load_tokenizer(model_path, {}, eos_token_ids=config.get("eos_token_id", None))
+    else:
+        model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
 
     if isinstance(quant_predicate, str):
         quant_predicate = mixed_quant_predicate_builder(quant_predicate, model)
@@ -146,13 +182,15 @@ def convert(
         print("[INFO] Dequantizing")
         model = dequantize_model(model)
 
+    # If hf_path is a local directory, do not attempt to create/update a model card
+    hf_repo_for_card = None if Path(hf_path).exists() else hf_path
     save(
         mlx_path,
         model_path,
         model,
         tokenizer,
         config,
-        hf_repo=hf_path,
+        hf_repo=hf_repo_for_card,
     )
 
     if upload_repo is not None:
@@ -190,6 +228,13 @@ def configure_parser() -> argparse.ArgumentParser:
         type=str,
         required=False,
     )
+    parser.add_argument(
+        "--task",
+        choices=["generate", "embed"],
+        default="generate",
+        help="Task type: generate (text generation) or embed (embeddings)",
+    )
+
     parser.add_argument(
         "--dtype",
         help="Type to save the non-quantized parameters. Defaults to config.json's `torch_dtype` or the current model weights dtype.",
