@@ -34,6 +34,7 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float
     vocab_size: int
     num_key_value_heads: int
+    head_dim: int = 128
 
     # Extra projector dims
     projector_dim: int = 1024
@@ -53,12 +54,17 @@ class Attention(nn.Module):
         dim = args.hidden_size
         self.n_heads = n_heads = args.num_attention_heads
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
-        head_dim = dim // n_heads
+        # Qwen3-Embedding-4B stores a fixed head_dim (128) even when
+        # `hidden_size / num_attention_heads` differs.  Prefer `head_dim` from
+        # config if available, otherwise fall back to dim // n_heads.
+        head_dim = getattr(args, "head_dim", dim // n_heads)
         self.scale = head_dim ** -0.5
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=True)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
+        # Output projection back to hidden_size (dim)
+        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
         self.rope = initialize_rope(
             head_dim,
@@ -84,6 +90,8 @@ class Attention(nn.Module):
 
         out = scaled_dot_product_attention(q, k, v, cache=cache, scale=self.scale, mask=mask)
         out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        # Project back to hidden dimension
+        out = self.o_proj(out)
         return out
 
 
